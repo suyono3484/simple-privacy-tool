@@ -1,6 +1,8 @@
 package spt
 
-import "github.com/spf13/cobra"
+import (
+	"github.com/spf13/cobra"
+)
 
 var (
 	rootCmd = &cobra.Command{
@@ -29,6 +31,18 @@ func init() {
 
 func encrypt(cmd *cobra.Command, args []string) error {
 	//TODO: implementation
+
+	//// this is the sample of reading password
+	//fmt.Print("input passphrase: ")
+	//passwd, err := privacy.ReadPassword()
+	//if err != nil {
+	//	return err
+	//}
+	//fmt.Println()
+	//
+	//fmt.Printf("password: %s\n", passwd)
+	//// end of sample
+
 	return nil
 }
 
