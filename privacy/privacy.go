@@ -5,11 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"io"
+	"os"
+
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/term"
-	"io"
-	"os"
 )
 
 type CipherMethodType byte
@@ -35,15 +36,17 @@ var (
 
 type Reader struct {
 	*Privacy
-	reader    io.Reader
-	buf       []byte
-	bufSlice  []byte
-	spillOver []byte
+	reader   io.Reader
+	buf      []byte
+	bufSlice []byte
 }
 
 type WriteCloser struct {
 	*Privacy
-	writeCloser io.WriteCloser
+	writeCloser  io.WriteCloser
+	buf          []byte
+	bufSlice     []byte
+	magicWritten bool
 }
 
 type Privacy struct {
@@ -71,8 +74,9 @@ func NewPrivacyWriteCloser(wc io.WriteCloser, cmType CipherMethodType) *WriteClo
 	privacy := newPrivacy()
 	privacy.cmType = cmType
 	return &WriteCloser{
-		Privacy:     privacy,
-		writeCloser: wc,
+		Privacy:      privacy,
+		writeCloser:  wc,
+		magicWritten: false,
 	}
 }
 
@@ -140,6 +144,47 @@ func (p *Privacy) GenerateKey(passphrase string) error {
 	return nil
 }
 
+func (wc *WriteCloser) Write(b []byte) (n int, err error) {
+	var (
+		// segmentLen      uint32
+		// segmentLenBytes []byte
+		// nonce           []byte
+		// ciphertext      []byte
+		// plaintext       []byte
+		copied int
+	)
+
+	if wc.aead == nil {
+		return 0, ErrInvalidKeyState
+	}
+
+	if cap(wc.buf) != int(wc.segmentSize)+wc.aead.NonceSize()+wc.aead.Overhead() {
+		wc.buf = make([]byte, int(wc.segmentSize)+wc.aead.NonceSize()+wc.aead.Overhead())
+		wc.bufSlice = wc.buf[wc.aead.NonceSize():wc.aead.NonceSize()]
+	}
+
+	if !wc.magicWritten {
+		n, err = wc.writeCloser.Write(wc.salt)
+		if err != nil {
+			return
+		}
+		wc.magicWritten = true
+	}
+
+	copied = 0
+	for copied < len(b) {
+		if len(wc.bufSlice) == int(wc.segmentSize) {
+
+		} else {
+			if len(b[copied:]) <= int(wc.segmentSize)-len(wc.bufSlice) {
+				wc.bufSlice = wc.buf[wc.aead.NonceSize() : len(wc.bufSlice)+len(b[copied:])]
+			}
+		}
+	}
+
+	return
+}
+
 func (r *Reader) ReadMagic() (err error) {
 	if r.cmType == Uninitialised {
 		magic := make([]byte, 16)
@@ -173,9 +218,10 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 	var (
 		segmentLen      uint32
 		segmentLenBytes []byte
-		//nonce           []byte
-		//ciphertext      []byte
-		//plaintext       []byte
+		nonce           []byte
+		ciphertext      []byte
+		plaintext       []byte
+		copied          int
 	)
 
 	if r.cmType == Uninitialised {
@@ -190,31 +236,48 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 		r.buf = make([]byte, int(r.segmentSize)+r.aead.Overhead()+r.aead.NonceSize())
 	}
 
-	if cap(r.spillOver) != int(r.segmentSize) {
-		r.spillOver = make([]byte, int(r.segmentSize))
+	copied = 0
+	for copied < len(b) {
+		if len(r.bufSlice) == 0 {
+			//TODO: nothing in the buffer, fill it up
+			segmentLenBytes = make([]byte, segmentSizeBytesLen)
+			n, err = r.reader.Read(segmentLenBytes)
+			if err != nil {
+				return
+			}
+
+			segmentLen = binary.LittleEndian.Uint32(segmentLenBytes)
+			if segmentLen > r.segmentSize {
+				return 0, ErrInvalidSegmentLength
+			}
+
+			n, err = r.reader.Read(r.buf)
+			if err != nil {
+				return
+			}
+
+			nonce = r.buf[:r.aead.NonceSize()]
+			ciphertext = r.buf[r.aead.NonceSize():]
+			plaintext = ciphertext[:0]
+
+			r.bufSlice, err = r.aead.Open(plaintext, nonce, ciphertext, segmentLenBytes)
+			if err != nil {
+				return
+			}
+		} else {
+			if len(b)-copied <= len(r.bufSlice) {
+				copy(b[copied:], r.bufSlice[:len(b)-copied])
+				r.bufSlice = r.bufSlice[len(b)-copied:]
+				copied += len(b) - copied
+			} else {
+				copy(b[copied:], r.bufSlice)
+				copied += len(r.bufSlice)
+				r.bufSlice = r.bufSlice[:0]
+			}
+		}
 	}
 
-	if len(r.bufSlice) == 0 {
-		//TODO: nothing in the buffer, fill it up
-		segmentLenBytes = make([]byte, segmentSizeBytesLen)
-		n, err = r.reader.Read(segmentLenBytes)
-		if err != nil {
-			return
-		}
-
-		segmentLen = binary.LittleEndian.Uint32(segmentLenBytes)
-		if segmentLen > r.segmentSize {
-			return 0, ErrInvalidSegmentLength
-		}
-
-		n, err = r.reader.Read(r.buf)
-		if err != nil {
-			return
-		}
-	}
-
-	//TODO: fix me, placeholder!
-	return 0, nil
+	return copied, nil
 }
 
 func ReadPassphraseFromTerminal() (string, error) {
