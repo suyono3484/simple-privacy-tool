@@ -4,34 +4,42 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 
-	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/term"
 )
 
 type CipherMethodType byte
 
+type KeyGen interface {
+	json.Marshaler
+	GenerateKey(password, salt []byte) []byte
+}
+
 const (
 	segmentSizeBytesLen int = 4
 
 	Uninitialised   CipherMethodType = 0
 	XChaCha20Simple CipherMethodType = 1
+	AES256GCMSimple CipherMethodType = 2
 
-	DefaultCipherMethod CipherMethodType = XChaCha20Simple
+	DefaultCipherMethod = XChaCha20Simple
 )
 
 var (
-	ErrInvalidSaltLen       = errors.New("invalid salt length")
-	ErrUninitialisedMethod  = errors.New("cipher method type uninitialised")
-	ErrInvalidCipherMethod  = errors.New("invalid cipher method type")
-	ErrCannotReadMagicBytes = errors.New("cannot read magic bytes")
+	ErrInvalidSaltLen      = errors.New("invalid salt length")
+	ErrUninitialisedSalt   = errors.New("uninitialised salt")
+	ErrUninitialisedMethod = errors.New("cipher method type uninitialised")
+	ErrInvalidCipherMethod = errors.New("invalid cipher method type")
+	//ErrCannotReadMagicBytes = errors.New("cannot read magic bytes")	//no usage for now
 	ErrInvalidReadFlow      = errors.New("func ReadMagic should be called before calling Read")
 	ErrInvalidKeyState      = errors.New("func GenerateKey should be called first")
 	ErrInvalidSegmentLength = errors.New("segment length is too long")
+	segmentLenBytes         = make([]byte, segmentSizeBytesLen)
 )
 
 type Reader struct {
@@ -39,6 +47,7 @@ type Reader struct {
 	reader   io.Reader
 	buf      []byte
 	bufSlice []byte
+	isEOF    bool
 }
 
 type WriteCloser struct {
@@ -54,24 +63,39 @@ type Privacy struct {
 	segmentSize uint32
 	cmType      CipherMethodType
 	aead        cipher.AEAD
+	keygen      KeyGen
 }
 
-func newPrivacy() *Privacy {
+func newPrivacy(k KeyGen) *Privacy {
 	return &Privacy{
 		segmentSize: 64 * 1024 * 1024,
 		cmType:      Uninitialised,
+		keygen:      k,
 	}
 }
 
 func NewPrivacyReader(reader io.Reader) *Reader {
+	return NewPrivacyReaderWithKeyGen(reader, NewArgon2())
+}
+
+func NewPrivacyReaderWithKeyGen(reader io.Reader, keygen KeyGen) *Reader {
 	return &Reader{
-		Privacy: newPrivacy(),
+		Privacy: newPrivacy(keygen),
 		reader:  reader,
+		isEOF:   false,
 	}
 }
 
+func NewPrivacyWriterCloserDefault(wc io.WriteCloser) *WriteCloser {
+	return NewPrivacyWriteCloser(wc, DefaultCipherMethod)
+}
+
 func NewPrivacyWriteCloser(wc io.WriteCloser, cmType CipherMethodType) *WriteCloser {
-	privacy := newPrivacy()
+	return NewPrivacyWriteCloserWithKeyGen(wc, cmType, NewArgon2())
+}
+
+func NewPrivacyWriteCloserWithKeyGen(wc io.WriteCloser, cmType CipherMethodType, keygen KeyGen) *WriteCloser {
+	privacy := newPrivacy(keygen)
 	privacy.cmType = cmType
 	return &WriteCloser{
 		Privacy:      privacy,
@@ -130,7 +154,11 @@ func (p *Privacy) GenerateKey(passphrase string) error {
 		return ErrUninitialisedMethod
 	}
 
-	key = argon2.IDKey([]byte(passphrase), p.salt, 1, 16*1024, 4, 32)
+	if len(p.salt) != 16 {
+		return ErrUninitialisedSalt
+	}
+
+	key = p.keygen.GenerateKey([]byte(passphrase), p.salt)
 	switch p.cmType {
 	case XChaCha20Simple:
 		p.aead, err = chacha20poly1305.NewX(key)
@@ -146,12 +174,10 @@ func (p *Privacy) GenerateKey(passphrase string) error {
 
 func (wc *WriteCloser) Write(b []byte) (n int, err error) {
 	var (
-		// segmentLen      uint32
-		// segmentLenBytes []byte
-		// nonce           []byte
-		// ciphertext      []byte
-		// plaintext       []byte
-		copied int
+		copied     int
+		nonceSize  int
+		lastMarker int
+		plaintext  []byte
 	)
 
 	if wc.aead == nil {
@@ -171,18 +197,72 @@ func (wc *WriteCloser) Write(b []byte) (n int, err error) {
 		wc.magicWritten = true
 	}
 
+	nonceSize = wc.aead.NonceSize()
 	copied = 0
 	for copied < len(b) {
 		if len(wc.bufSlice) == int(wc.segmentSize) {
-
-		} else {
-			if len(b[copied:]) <= int(wc.segmentSize)-len(wc.bufSlice) {
-				wc.bufSlice = wc.buf[wc.aead.NonceSize() : len(wc.bufSlice)+len(b[copied:])]
+			n, err = wc.writeSegment()
+			if err != nil {
+				return
 			}
+		} else {
+			lastMarker = len(wc.bufSlice)
+			plaintext = wc.buf[nonceSize : nonceSize+len(wc.bufSlice)]
+			if len(b[copied:]) <= int(wc.segmentSize)-len(wc.bufSlice) {
+				plaintext = plaintext[:len(plaintext)+len(b[copied:])]
+				copied += copy(plaintext[lastMarker:], b[copied:])
+			} else {
+				plaintext = plaintext[:int(wc.segmentSize)]
+				copied += copy(plaintext[lastMarker:], b[copied:])
+			}
+			wc.bufSlice = plaintext
 		}
 	}
 
-	return
+	return copied, nil
+}
+
+func (wc *WriteCloser) writeSegment() (n int, err error) {
+	var (
+		nonce      []byte
+		ciphertext []byte
+		plaintext  []byte
+		written    int
+	)
+
+	written = len(wc.bufSlice)
+	binary.LittleEndian.PutUint32(segmentLenBytes, uint32(written))
+	n, err = wc.writeCloser.Write(segmentLenBytes)
+	if err != nil {
+		return
+	}
+
+	nonce = wc.buf[:wc.aead.NonceSize()]
+	_, err = rand.Read(nonce)
+	if err != nil {
+		return
+	}
+	plaintext = wc.buf[wc.aead.NonceSize() : wc.aead.NonceSize()+written]
+	ciphertext = plaintext[:0]
+
+	wc.aead.Seal(ciphertext, nonce, plaintext, segmentLenBytes)
+	n, err = wc.writeCloser.Write(wc.buf[:written+wc.aead.NonceSize()+wc.aead.Overhead()])
+	if err != nil {
+		return
+	}
+	wc.bufSlice = wc.buf[wc.aead.NonceSize():wc.aead.NonceSize()]
+
+	return written, nil
+}
+
+func (wc *WriteCloser) Close() (err error) {
+	if len(wc.bufSlice) > 0 {
+		_, err = wc.writeSegment()
+		if err != nil {
+			return
+		}
+	}
+	return wc.writeCloser.Close()
 }
 
 func (r *Reader) ReadMagic() (err error) {
@@ -216,12 +296,11 @@ func (r *Reader) ReadMagic() (err error) {
 
 func (r *Reader) Read(b []byte) (n int, err error) {
 	var (
-		segmentLen      uint32
-		segmentLenBytes []byte
-		nonce           []byte
-		ciphertext      []byte
-		plaintext       []byte
-		copied          int
+		segmentLen uint32
+		nonce      []byte
+		ciphertext []byte
+		plaintext  []byte
+		copied     int
 	)
 
 	if r.cmType == Uninitialised {
@@ -232,6 +311,10 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 		return 0, ErrInvalidKeyState
 	}
 
+	if r.isEOF {
+		return 0, io.EOF
+	}
+
 	if cap(r.buf) != int(r.segmentSize)+r.aead.Overhead()+r.aead.NonceSize() {
 		r.buf = make([]byte, int(r.segmentSize)+r.aead.Overhead()+r.aead.NonceSize())
 	}
@@ -239,10 +322,17 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 	copied = 0
 	for copied < len(b) {
 		if len(r.bufSlice) == 0 {
-			//TODO: nothing in the buffer, fill it up
-			segmentLenBytes = make([]byte, segmentSizeBytesLen)
 			n, err = r.reader.Read(segmentLenBytes)
 			if err != nil {
+				if err == io.EOF {
+					if copied > 0 {
+						r.isEOF = true
+						return copied, nil
+					} else {
+						r.isEOF = true
+						return 0, err
+					}
+				}
 				return
 			}
 
@@ -251,28 +341,28 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 				return 0, ErrInvalidSegmentLength
 			}
 
-			n, err = r.reader.Read(r.buf)
+			n, err = r.reader.Read(r.buf[:int(segmentLen)+r.aead.Overhead()+r.aead.NonceSize()])
 			if err != nil {
 				return
 			}
 
 			nonce = r.buf[:r.aead.NonceSize()]
-			ciphertext = r.buf[r.aead.NonceSize():]
+			ciphertext = r.buf[r.aead.NonceSize() : r.aead.NonceSize()+int(segmentLen)+r.aead.Overhead()]
 			plaintext = ciphertext[:0]
 
-			r.bufSlice, err = r.aead.Open(plaintext, nonce, ciphertext, segmentLenBytes)
-			if err != nil {
+			if _, err = r.aead.Open(plaintext, nonce, ciphertext, segmentLenBytes); err != nil {
 				return
 			}
+			plaintext = plaintext[:int(segmentLen)]
+			r.bufSlice = plaintext
 		} else {
-			if len(b)-copied <= len(r.bufSlice) {
-				copy(b[copied:], r.bufSlice[:len(b)-copied])
-				r.bufSlice = r.bufSlice[len(b)-copied:]
-				copied += len(b) - copied
+			if len(b[copied:]) <= len(r.bufSlice) {
+				cp := copy(b[copied:], r.bufSlice)
+				r.bufSlice = r.bufSlice[cp:]
+				copied += cp
 			} else {
-				copy(b[copied:], r.bufSlice)
-				copied += len(r.bufSlice)
-				r.bufSlice = r.bufSlice[:0]
+				copied += copy(b[copied:], r.bufSlice)
+				r.bufSlice = r.buf[r.aead.NonceSize():r.aead.NonceSize()]
 			}
 		}
 	}
@@ -281,7 +371,7 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 }
 
 func ReadPassphraseFromTerminal() (string, error) {
-	var inputFd int = int(os.Stdin.Fd())
+	var inputFd = int(os.Stdin.Fd())
 	if !term.IsTerminal(inputFd) {
 		return "", errors.New("not a terminal")
 	}
