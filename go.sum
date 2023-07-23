@@ -1,3 +1,5 @@
+gitea.suyono.dev/suyono/terminal_wrapper v0.0.0-20230722101024-a3e50949f40f h1:yPac52dWHSutQH99FUhqz9rt2FHKaHr9srdJuDI9pkg=
+gitea.suyono.dev/suyono/terminal_wrapper v0.0.0-20230722101024-a3e50949f40f/go.mod h1:I8qBJ8oaj+RwbLggXWNRrvRCDD+/bnRoQne0V4xsBNU=
 github.com/cpuguy83/go-md2man/v2 v2.0.2/go.mod h1:tgQtvFlXSQOSOSIRvRPT7W67SCa46tRHOmNcaadrF8o=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
 github.com/inconshreveable/mousetrap v1.1.0/go.mod h1:vpF70FUmC8bwa3OWnCshd2FqLfsEA9PFc4w1p2J65bw=

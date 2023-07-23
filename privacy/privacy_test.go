@@ -91,14 +91,25 @@ func TestReadWriteClose(t *testing.T) {
 	ur := mr.New(mr.NewSource(1))
 	bb := make([]byte, 1048)
 
-	var bar int
+	var (
+		//bar int
+		n  int
+		wl int
+		rl int
+	)
 	for i := 0; i < 63; i++ {
-		bar = 1000 + ur.Intn(49)
-		ur.Read(bb[:bar])
-		sha.Write(bb[:bar])
-		if _, err = writer.Write(bb[:bar]); err != nil {
+		//bar = 1000 + ur.Intn(49)
+		//ur.Read(bb[:bar])
+		//sha.Write(bb[:bar])
+		//if n, err = writer.Write(bb[:bar]); err != nil {
+		//	t.Fatal("unexpected: Write failed", err)
+		//}
+		ur.Read(bb)
+		sha.Write(bb)
+		if n, err = writer.Write(bb); err != nil {
 			t.Fatal("unexpected: Write failed", err)
 		}
+		wl += n
 	}
 
 	if err = writer.Close(); err != nil {
@@ -120,25 +131,29 @@ func TestReadWriteClose(t *testing.T) {
 
 	sha.Reset()
 	err = nil
+	n = 0
 	for err == nil {
-		if _, err = reader.Read(bb); err != nil {
+		if n, err = reader.Read(bb); err != nil {
 			if err == io.EOF {
 				continue
 			} else {
 				t.Fatal("unexpected: Read failed", err)
 			}
 		}
+		rl += n
 		sha.Write(bb)
 	}
 
 	readHash := sha.Sum(nil)
 	t.Log("read hash:", hex.EncodeToString(readHash))
 
-	//for i := range writeHash {
-	//	if readHash[i] != writeHash[i] {
-	//		t.Fatal("unexpected: mismatch hash")
-	//	}
-	//}
+	t.Log("wl", wl)
+	t.Log("rl", rl)
+	for i := range writeHash {
+		if readHash[i] != writeHash[i] {
+			t.Fatal("unexpected: mismatch hash")
+		}
+	}
 }
 
 func TestTrial(t *testing.T) {

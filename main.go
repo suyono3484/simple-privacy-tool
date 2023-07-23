@@ -9,5 +9,6 @@ func main() {
 	err := spt.Execute()
 	if err != nil {
 		fmt.Printf("error: %v\n", err)
+		//panic(err)
 	}
 }

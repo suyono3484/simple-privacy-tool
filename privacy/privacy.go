@@ -6,11 +6,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"io"
-	"os"
-
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/term"
+	"io"
 )
 
 type CipherMethodType byte
@@ -368,18 +365,4 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 	}
 
 	return copied, nil
-}
-
-func ReadPassphraseFromTerminal() (string, error) {
-	var inputFd = int(os.Stdin.Fd())
-	if !term.IsTerminal(inputFd) {
-		return "", errors.New("not a terminal")
-	}
-
-	passwd, err := term.ReadPassword(inputFd)
-	if err != nil {
-		return "", err
-	}
-
-	return string(passwd), nil
 }
