@@ -27,12 +27,7 @@ simple-privacy-tool decrypt cryptedfile plainfile
 ```
 
 #### Using STDIN/STDOUT
-`simple-privacy-tool` can operate on `STDIN` or `STDOUT`. Just replace the file path with `-`
+`simple-privacy-tool` can operate on `STDOUT`. Just replace the file path with `-`
 ```shell
-tar -zcf - dir | simple-privacy-tool encrypt - - | another-command
-```
-
-Special usage, just omit both file paths to use `STDIN` and `STDOUT`.
-```shell
-tar -zcf - dir | simple-privacy-tool encrypt | another-command
+simple-privacy-tool encrypt srcFile - | another-command
 ```
