@@ -2,9 +2,11 @@ package spt
 
 import (
 	"errors"
+	"os"
+
 	tw "gitea.suyono.dev/suyono/terminal_wrapper"
 	"github.com/spf13/cobra"
-	"os"
+	"log"
 )
 
 type cApp struct {
@@ -21,20 +23,39 @@ var (
 	ErrPassphraseMismatch = errors.New("mismatch passphrase")
 
 	rootCmd = &cobra.Command{
-		Use:   "spt",
+		Use:   "simple-privacy-tool",
 		Short: "a simple tool to encrypt and decrypt file",
 	}
 
+	hintCmd = &cobra.Command{
+		Use:   "hint file",
+		Args:  cobra.ExactArgs(1),
+		RunE:  CmdReadHint,
+		Short: "extract and print hint from encrypted file",
+	}
+
 	encryptCmd = &cobra.Command{
-		Use:  "encrypt",
+		Use:  "encrypt srcFile dstFile",
 		Args: validatePositionalArgs,
-		RunE: encrypt,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := processFlags(); err != nil {
+				return err
+			}
+			return encrypt(cmd, args)
+		},
+		Short: "encrypt srcFile, output to dstFile",
 	}
 
 	decryptCmd = &cobra.Command{
-		Use:  "decrypt",
-		RunE: decrypt,
-		Args: validatePositionalArgs,
+		Use: "decrypt srcFile dstFile",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := processFlags(); err != nil {
+				return err
+			}
+			return decrypt(cmd, args)
+		},
+		Args:  validatePositionalArgs,
+		Short: "decrypt srcFile, output to dstFile",
 	}
 )
 
@@ -43,7 +64,8 @@ func Execute() error {
 }
 
 func init() {
-	rootCmd.AddCommand(encryptCmd, decryptCmd)
+	initFlags()
+	rootCmd.AddCommand(encryptCmd, decryptCmd, hintCmd)
 }
 
 func validatePositionalArgs(cmd *cobra.Command, args []string) error {
@@ -65,11 +87,13 @@ func encrypt(cmd *cobra.Command, args []string) (err error) {
 	if terminal, err = tw.MakeTerminal(os.Stderr); err != nil {
 		return
 	}
+	log.SetOutput(terminal)
 	defer func() {
 		existingErr := err
 		if err = terminal.Restore(); err == nil && existingErr != nil {
 			err = existingErr
 		}
+		log.SetOutput(os.Stderr)
 	}()
 
 	app = &cApp{
@@ -80,13 +104,13 @@ func encrypt(cmd *cobra.Command, args []string) (err error) {
 		return
 	}
 
-	eApp = newEncryptApp(app)
+	eApp = &encryptApp{
+		cApp: *app,
+	}
 
 	if err = eApp.GetPassphrase(); err != nil {
 		return
 	}
-
-	//TODO: process additional flags
 
 	if err = eApp.ProcessFiles(); err != nil {
 		return
@@ -105,11 +129,13 @@ func decrypt(cmd *cobra.Command, args []string) (err error) {
 	if terminal, err = tw.MakeTerminal(os.Stderr); err != nil {
 		return
 	}
+	log.SetOutput(terminal)
 	defer func() {
 		existingErr := err
 		if err = terminal.Restore(); err == nil && existingErr != nil {
 			err = existingErr
 		}
+		log.SetOutput(os.Stderr)
 	}()
 
 	app = &cApp{
@@ -120,13 +146,13 @@ func decrypt(cmd *cobra.Command, args []string) (err error) {
 		return
 	}
 
-	dApp = newDecryptApp(app)
+	dApp = &decryptApp{
+		cApp: *app,
+	}
 
 	if err = dApp.GetPassphrase(); err != nil {
 		return
 	}
-
-	//TODO: process additional flags
 
 	if err = dApp.ProcessFiles(); err != nil {
 		return

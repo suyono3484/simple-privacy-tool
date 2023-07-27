@@ -1,6 +1,7 @@
 package spt
 
 import (
+	"encoding/base64"
 	"gitea.suyono.dev/suyono/simple-privacy-tool/privacy"
 	"io"
 )
@@ -8,12 +9,6 @@ import (
 type encryptApp struct {
 	cApp
 	wc *privacy.WriteCloser
-}
-
-func newEncryptApp(a *cApp) *encryptApp {
-	return &encryptApp{
-		cApp: *a,
-	}
 }
 
 func (e *encryptApp) GetPassphrase() (err error) {
@@ -40,7 +35,21 @@ func (e *encryptApp) GetPassphrase() (err error) {
 }
 
 func (e *encryptApp) ProcessFiles() (err error) {
-	e.wc = privacy.NewPrivacyWriteCloser(e.dstFile, privacy.DefaultCipherMethod) //TODO: need to handle when custom keygen accepted
+	var dst io.WriteCloser
+
+	if f.IsBase64() {
+		dst = base64.NewEncoder(base64.StdEncoding, e.dstFile)
+	} else {
+		dst = e.dstFile
+	}
+
+	if f.IncludeHint() {
+		if err = WriteHint(f.KeyGen(), dst); err != nil {
+			return
+		}
+	}
+
+	e.wc = privacy.NewPrivacyWriteCloserWithKeyGen(dst, f.CipherMethod(), f.KeyGen())
 	if err = e.wc.NewSalt(); err != nil {
 		return
 	}

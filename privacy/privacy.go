@@ -1,11 +1,13 @@
 package privacy
 
 import (
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"golang.org/x/crypto/chacha20poly1305"
 	"io"
 )
@@ -20,9 +22,9 @@ type KeyGen interface {
 const (
 	segmentSizeBytesLen int = 4
 
-	Uninitialised   CipherMethodType = 0
-	XChaCha20Simple CipherMethodType = 1
-	AES256GCMSimple CipherMethodType = 2
+	Uninitialised   CipherMethodType = 0x00
+	XChaCha20Simple CipherMethodType = 0x01
+	AES256GCMSimple CipherMethodType = 0x02
 
 	DefaultCipherMethod = XChaCha20Simple
 )
@@ -31,13 +33,18 @@ var (
 	ErrInvalidSaltLen      = errors.New("invalid salt length")
 	ErrUninitialisedSalt   = errors.New("uninitialised salt")
 	ErrUninitialisedMethod = errors.New("cipher method type uninitialised")
-	ErrInvalidCipherMethod = errors.New("invalid cipher method type")
 	//ErrCannotReadMagicBytes = errors.New("cannot read magic bytes")	//no usage for now
 	ErrInvalidReadFlow      = errors.New("func ReadMagic should be called before calling Read")
 	ErrInvalidKeyState      = errors.New("func GenerateKey should be called first")
 	ErrInvalidSegmentLength = errors.New("segment length is too long")
 	segmentLenBytes         = make([]byte, segmentSizeBytesLen)
 )
+
+type InvalidCipherMethod []byte
+
+func (i InvalidCipherMethod) Error() string {
+	return "invalid cipher method type"
+}
 
 type Reader struct {
 	*Privacy
@@ -158,12 +165,19 @@ func (p *Privacy) GenerateKey(passphrase string) error {
 	key = p.keygen.GenerateKey([]byte(passphrase), p.salt)
 	switch p.cmType {
 	case XChaCha20Simple:
-		p.aead, err = chacha20poly1305.NewX(key)
+		if p.aead, err = chacha20poly1305.NewX(key); err != nil {
+			return err
+		}
+	case AES256GCMSimple:
+		var block cipher.Block
+		if block, err = aes.NewCipher(key); err != nil {
+			return err
+		}
+		if p.aead, err = cipher.NewGCM(block); err != nil {
+			return err
+		}
 	default:
-		return ErrInvalidCipherMethod
-	}
-	if err != nil {
-		return err
+		return InvalidCipherMethod([]byte{})
 	}
 
 	return nil
@@ -187,7 +201,7 @@ func (wc *WriteCloser) Write(b []byte) (n int, err error) {
 	}
 
 	if !wc.magicWritten {
-		n, err = wc.writeCloser.Write(wc.salt)
+		n, err = wc.writeUp(wc.salt)
 		if err != nil {
 			return
 		}
@@ -229,7 +243,7 @@ func (wc *WriteCloser) writeSegment() (n int, err error) {
 
 	written = len(wc.bufSlice)
 	binary.LittleEndian.PutUint32(segmentLenBytes, uint32(written))
-	n, err = wc.writeCloser.Write(segmentLenBytes)
+	n, err = wc.writeUp(segmentLenBytes)
 	if err != nil {
 		return
 	}
@@ -243,13 +257,32 @@ func (wc *WriteCloser) writeSegment() (n int, err error) {
 	ciphertext = plaintext[:0]
 
 	wc.aead.Seal(ciphertext, nonce, plaintext, segmentLenBytes)
-	n, err = wc.writeCloser.Write(wc.buf[:written+wc.aead.NonceSize()+wc.aead.Overhead()])
+	n, err = wc.writeUp(wc.buf[:written+wc.aead.NonceSize()+wc.aead.Overhead()])
 	if err != nil {
 		return
 	}
 	wc.bufSlice = wc.buf[wc.aead.NonceSize():wc.aead.NonceSize()]
 
 	return written, nil
+}
+
+func (wc *WriteCloser) writeUp(b []byte) (n int, err error) {
+	var (
+		total int
+	)
+
+	for {
+		if n, err = wc.writeCloser.Write(b[total:]); err != nil {
+			return n + total, err
+		}
+
+		total += n
+		if total == len(b) {
+			break
+		}
+	}
+
+	return total, nil
 }
 
 func (wc *WriteCloser) Close() (err error) {
@@ -265,30 +298,44 @@ func (wc *WriteCloser) Close() (err error) {
 func (r *Reader) ReadMagic() (err error) {
 	if r.cmType == Uninitialised {
 		magic := make([]byte, 16)
-		_, err = r.reader.Read(magic[:1])
-		if err != nil {
+		if _, err = r.readUp(magic); err != nil {
 			return
 		}
 
 		switch CipherMethodType(magic[0]) {
 		case XChaCha20Simple:
 			r.cmType = XChaCha20Simple
-			_, err = r.reader.Read(magic[1:])
-			if err != nil {
-				return
-			}
-
-			err = r.SetSalt(magic)
-			if err != nil {
-				return
-			}
+		case AES256GCMSimple:
+			r.cmType = AES256GCMSimple
 		default:
-			return ErrInvalidCipherMethod
+			return InvalidCipherMethod(magic)
 		}
 
+		if err = r.SetSalt(magic); err != nil {
+			return
+		}
 	}
 
 	return nil
+}
+
+func (r *Reader) readUp(b []byte) (n int, err error) {
+	var (
+		total int
+	)
+
+	for {
+		if n, err = r.reader.Read(b[total:]); err != nil {
+			return n + total, err
+		}
+
+		total += n
+		if total == len(b) {
+			break
+		}
+	}
+
+	return total, nil
 }
 
 func (r *Reader) Read(b []byte) (n int, err error) {
@@ -316,10 +363,11 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 		r.buf = make([]byte, int(r.segmentSize)+r.aead.Overhead()+r.aead.NonceSize())
 	}
 
+	//log.Printf("Read for %d bytes\n", len(b))
 	copied = 0
 	for copied < len(b) {
 		if len(r.bufSlice) == 0 {
-			n, err = r.reader.Read(segmentLenBytes)
+			n, err = r.readUp(segmentLenBytes)
 			if err != nil {
 				if err == io.EOF {
 					if copied > 0 {
@@ -338,7 +386,7 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 				return 0, ErrInvalidSegmentLength
 			}
 
-			n, err = r.reader.Read(r.buf[:int(segmentLen)+r.aead.Overhead()+r.aead.NonceSize()])
+			n, err = r.readUp(r.buf[:int(segmentLen)+r.aead.Overhead()+r.aead.NonceSize()])
 			if err != nil {
 				return
 			}
@@ -348,7 +396,7 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 			plaintext = ciphertext[:0]
 
 			if _, err = r.aead.Open(plaintext, nonce, ciphertext, segmentLenBytes); err != nil {
-				return
+				return copied, fmt.Errorf("decrypt Read: %w", err)
 			}
 			plaintext = plaintext[:int(segmentLen)]
 			r.bufSlice = plaintext
@@ -364,5 +412,6 @@ func (r *Reader) Read(b []byte) (n int, err error) {
 		}
 	}
 
-	return copied, nil
+	n = copied
+	return
 }

@@ -1,3 +1,5 @@
 /.idea/
 /simple-privacy-tool
 /spt
+/vendor
+/test-payload*
